@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from ..config import settings
 from .routes import router
 
-DIST = Path(__file__).resolve().parent.parent.parent / "test" / "dist"
+DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
 
 
 def create_app() -> FastAPI:
