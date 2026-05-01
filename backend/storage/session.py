@@ -133,6 +133,24 @@ class InMemoryStore:
             return None
         return {**sess, "traces": self.get_traces(session_id)}
 
+    # ---- original goal ----
+
+    def get_original_goal(self, session_id: str) -> Optional[str]:
+        return self._configs.get(session_id, {}).get("original_goal")
+
+    def set_original_goal(self, session_id: str, goal: str) -> None:
+        if session_id in self._configs:
+            self._configs[session_id]["original_goal"] = goal
+
+    # ---- goal embedding ----
+
+    def get_goal_embedding(self, session_id: str):
+        return self._configs.get(session_id, {}).get("goal_embedding")
+
+    def set_goal_embedding(self, session_id: str, embedding) -> None:
+        if session_id in self._configs:
+            self._configs[session_id]["goal_embedding"] = embedding
+
     # ---- active trace ----
 
     def set_active_trace(self, session_id: str, trace_id: str) -> None:
@@ -370,6 +388,38 @@ class SQLiteStore:
         sess = dict(row)
         sess["traces"] = self.get_traces(session_id)
         return sess
+
+    # ---- original goal ----
+
+    def get_original_goal(self, session_id: str) -> Optional[str]:
+        return self.get_config(session_id).get("original_goal")
+
+    def set_original_goal(self, session_id: str, goal: str) -> None:
+        config = self.get_config(session_id)
+        config["original_goal"] = goal
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE sessions SET session_config = ? WHERE session_id = ?",
+                (json.dumps(config), session_id),
+            )
+
+    # ---- goal embedding ----
+
+    def get_goal_embedding(self, session_id: str):
+        raw = self.get_config(session_id).get("goal_embedding")
+        if raw is None:
+            return None
+        import numpy as np
+        return np.array(raw, dtype=np.float32)
+
+    def set_goal_embedding(self, session_id: str, embedding) -> None:
+        config = self.get_config(session_id)
+        config["goal_embedding"] = embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE sessions SET session_config = ? WHERE session_id = ?",
+                (json.dumps(config), session_id),
+            )
 
     # ---- active trace ----
 

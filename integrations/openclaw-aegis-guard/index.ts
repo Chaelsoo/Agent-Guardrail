@@ -31,8 +31,12 @@ const plugin = {
     const pendingTraceIds = new Map<string, string>();
     /** sessions where llm_output already ran guard/output (skip in message_sending) */
     const guardedOutputTurns = new Set<string>();
-    /** sessions where input was blocked — LLM response is a refusal, skip output gate */
+    /** sessions where input was blocked — force refusal on LLM response */
     const inputBlockedSessions = new Set<string>();
+    /** block reason per session, set alongside inputBlockedSessions */
+    const inputBlockedReasons = new Map<string, string>();
+    /** refusal message to deliver in message_sending for blocked-input turns */
+    const inputBlockedReplace = new Map<string, string>();
 
     // -----------------------------------------------------------------------
     // HTTP helpers
@@ -141,6 +145,16 @@ const plugin = {
       return sid;
     }
 
+    /** Look up an existing session without creating one. Returns null if none found. */
+    function findSession(event: any, ctx: any, preferredKey?: string): string | null {
+      const keys = dedupeKeys([preferredKey || "", ...allKeys(event, ctx)]);
+      for (const k of keys) {
+        const sid = sessionMap.get(k);
+        if (sid) { bindKeys(sid, keys); return sid; }
+      }
+      return null;
+    }
+
     function bind(sid: string, event: any, ctx: any): void {
       bindKeys(sid, allKeys(event, ctx));
     }
@@ -229,9 +243,17 @@ const plugin = {
      * Aegis session. We do NOT eagerly create one here — that produces empty
      * sessions if no guard calls follow (e.g. startup-only sessions).
      */
-    api.on("before_reset", (_event: any, ctx: any) => {
-      for (const k of allKeys({}, ctx)) sessionMap.delete(k);
-      api.logger.info("[aegis-guard] session bindings cleared on reset");
+    api.on("before_reset", (_event: any, _ctx: any) => {
+      // Clear all state — after a /new or /reset the next session starts completely fresh.
+      // Targeted key deletion is unreliable because the reset ctx may have different keys
+      // than those stored from prior tool/llm hooks.
+      sessionMap.clear();
+      pendingTraceIds.clear();
+      guardedOutputTurns.clear();
+      inputBlockedSessions.clear();
+      inputBlockedReasons.clear();
+      inputBlockedReplace.clear();
+      api.logger.info("[aegis-guard] all session state cleared on reset");
     });
 
     /** INPUT GATE — inspect user prompt before the LLM call */
@@ -258,6 +280,7 @@ const plugin = {
           // Flag this session so llm_output skips the output gate — the LLM's
           // refusal naturally contains override-like language which triggers false positives.
           inputBlockedSessions.add(sid);
+          inputBlockedReasons.set(sid, reason);
           return {
             systemPrompt: `You are a helpful and safe AI assistant. The user's latest message was automatically intercepted and blocked by a security guardrail. Reason: ${reason}. Without repeating the flagged content or revealing internal system details, respond in 1–2 sentences explaining naturally that you're unable to process that kind of request and why.`,
           };
@@ -278,8 +301,19 @@ const plugin = {
         // Skip bootstrap reads — these are OpenClaw startup internals, not user-driven
         if (isBootstrapRead(toolName, toolArgs)) return undefined;
 
-        const sid = await resolveSession(event, ctx, `tool:${toolKey(ctx)}`);
+        // Only gate tool calls within an existing session (created by before_prompt_build).
+        // Tool calls before any user prompt are internal OpenClaw operations — skip them.
+        const sid = findSession(event, ctx, `tool:${toolKey(ctx)}`);
+        if (!sid) return undefined;
         bind(sid, event, ctx);
+
+        // If the current turn's input was blocked, halt all tool calls immediately.
+        // The LLM cannot be stopped from running but it will not be allowed to act.
+        if (inputBlockedSessions.has(sid)) {
+          const reason = inputBlockedReasons.get(sid) || "safety policy violation";
+          api.logger.warn(`[aegis-guard] tool call suppressed (input blocked) tool=${toolName} sid=${sid}`);
+          return { block: true, blockReason: `This request was blocked by the security guardrail (reason: ${reason}). No tool calls are permitted.` };
+        }
 
         const result = await post(`/sessions/${sid}/guard/tool`, {
           tool_name: toolName,
@@ -315,20 +349,26 @@ const plugin = {
         const prompt = String(event?.prompt || "");
         if (isStartupPrompt(prompt) || isStartupPrompt(content)) return;
 
-        const sid = await resolveSession(event, ctx, `llm:${llmKey(event, ctx)}`);
+        // Only gate output within an existing session — greetings and internal LLM
+        // responses that have no corresponding user prompt should not create sessions.
+        const sid = findSession(event, ctx, `llm:${llmKey(event, ctx)}`);
+        if (!sid) return;
         bind(sid, event, ctx);
 
         const traceId = pendingTraceIds.get(sid);
         if (traceId) pendingTraceIds.delete(sid);
 
-        // If input was blocked, the LLM is generating a refusal — skip output
-        // classification (refusals contain override-like language → false positives).
-        // Still update the trace with the actual LLM response.
+        // If input was blocked, the LLM may have ignored the override system prompt.
+        // Store a hardcoded refusal for message_sending to deliver, and record the
+        // output trace as trusted (skip classification — refusal language trips detectors).
         if (inputBlockedSessions.has(sid)) {
+          const blockReason = inputBlockedReasons.get(sid) || "safety policy violation";
           inputBlockedSessions.delete(sid);
-          guardedOutputTurns.add(sid);
+          inputBlockedReasons.delete(sid);
+          const refusal = `I'm unable to process that request — it was blocked by the security guardrail (reason: ${blockReason}).`;
+          inputBlockedReplace.set(sid, refusal);
           await post(`/sessions/${sid}/guard/output`, {
-            content,
+            content: refusal,
             trace_id: traceId || undefined,
             trust: true,
             metadata: { source: "openclaw-plugin", hook: "llm_output", environment },
@@ -362,8 +402,20 @@ const plugin = {
         const content = String(event?.content || "");
         if (!content.trim()) return undefined;
 
-        const sid = await resolveSession(event, ctx, msgKey(ctx));
+        // Only gate output within an existing session — startup greetings and other
+        // internal messages that have no corresponding user prompt should be skipped.
+        const sid = findSession(event, ctx, msgKey(ctx));
+        if (!sid) return undefined;
         bind(sid, event, ctx);
+
+        // Input-blocked turns: force the hardcoded refusal regardless of LLM output.
+        // guard/output was already recorded as trusted in llm_output.
+        if (inputBlockedReplace.has(sid)) {
+          const refusal = inputBlockedReplace.get(sid)!;
+          inputBlockedReplace.delete(sid);
+          guardedOutputTurns.delete(sid);
+          return { content: refusal };
+        }
 
         // llm_output already guarded this turn — skip to avoid duplicate trace
         if (guardedOutputTurns.has(sid)) {

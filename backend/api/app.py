@@ -33,11 +33,14 @@ def create_app() -> FastAPI:
     async def startup():
         from ..core.classifier import classifier
         from ..core.embedder import embedder
+        from ..core.toolcall_verifier import toolcall_verifier
         print("[Aegis] Loading classifier (qualifire/prompt-injection-sentinel)...")
         classifier.load()
         print("[Aegis] Loading embedder (all-MiniLM-L6-v2)...")
         embedder.load()
-        print("[Aegis] Models ready")
+        print("[Aegis] Loading tool call verifier (llm-semantic-router/toolcall-verifier)...")
+        toolcall_verifier.load()
+        print("[Aegis] All models ready")
         print_startup_summary()
 
     return app
