@@ -2,6 +2,7 @@ import { createBrowserRouter } from 'react-router';
 import { Layout } from './components/layout';
 import { SessionsPage } from './pages/sessions';
 import { NetworkPage } from './pages/network';
+import { ToolsPage } from './pages/tools';
 
 export const router = createBrowserRouter([
   {
@@ -15,6 +16,10 @@ export const router = createBrowserRouter([
       {
         path: 'network',
         Component: NetworkPage,
+      },
+      {
+        path: 'tools',
+        Component: ToolsPage,
       },
     ],
   },

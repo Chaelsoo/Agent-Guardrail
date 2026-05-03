@@ -1,4 +1,4 @@
-import { Shield, Activity, Network } from 'lucide-react';
+import { Shield, Activity, Network, Ban } from 'lucide-react';
 import { Link, useLocation } from 'react-router';
 
 export function AegisSidebar() {
@@ -7,6 +7,7 @@ export function AegisSidebar() {
   const navItems = [
     { path: '/', label: 'Sessions', icon: Activity },
     { path: '/network', label: 'Network', icon: Network },
+    { path: '/tools', label: 'Tools', icon: Ban },
   ];
 
   return (

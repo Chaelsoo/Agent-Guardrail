@@ -34,12 +34,18 @@ def create_app() -> FastAPI:
         from ..core.classifier import classifier
         from ..core.embedder import embedder
         from ..core.toolcall_verifier import toolcall_verifier
+        from ..core.pii_detector import pii_detector
+        from ..core.nsfw_detector import nsfw_detector
         print("[Aegis] Loading classifier (qualifire/prompt-injection-sentinel)...")
         classifier.load()
         print("[Aegis] Loading embedder (all-MiniLM-L6-v2)...")
         embedder.load()
         print("[Aegis] Loading tool call verifier (llm-semantic-router/toolcall-verifier)...")
         toolcall_verifier.load()
+        print("[Aegis] Loading PII detector (iiiorg/piiranha-v1-detect-personal-information)...")
+        pii_detector.load()
+        print("[Aegis] Loading NSFW detector (Falconsai/nsfw_image_detection)...")
+        nsfw_detector.load()
         print("[Aegis] All models ready")
         print_startup_summary()
 

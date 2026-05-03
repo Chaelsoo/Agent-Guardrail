@@ -30,6 +30,10 @@
       "enforceToolGate": {
         "type": "boolean",
         "default": true
+      },
+      "enforceMediaGate": {
+        "type": "boolean",
+        "default": true
       }
     }
   }

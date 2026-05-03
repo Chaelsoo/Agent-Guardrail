@@ -1,7 +1,9 @@
 """All API endpoints for Aegis."""
 
 import asyncio
+import base64
 import json
+import os
 import time
 import uuid
 from datetime import datetime
@@ -18,6 +20,8 @@ from ..config import settings
 from ..core.classifier import classifier
 from ..core.embedder import embedder
 from ..core.toolcall_verifier import toolcall_verifier
+from ..core.pii_detector import pii_detector
+from ..core.nsfw_detector import nsfw_detector
 from ..core.trajectory import compute_trajectory_score, update_trajectory
 from ..storage.session import get_store, publish, _severity
 
@@ -53,7 +57,8 @@ _INDIRECT_INJECTION_PATTERNS = _re.compile(
 # Network config persistence
 # ---------------------------------------------------------------------------
 
-_NET_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "network_config.json"
+_DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent.parent
+_NET_CONFIG_PATH = Path(os.getenv("AEGIS_DATA_DIR", str(_DEFAULT_DATA_DIR))) / "network_config.json"
 
 
 def _load_net() -> Dict[str, Any]:
@@ -107,6 +112,15 @@ class GuardToolBody(BaseModel):
 
 class DomainBody(BaseModel):
     domain: str
+
+
+class ToolDenyBody(BaseModel):
+    tool_name: str
+
+
+class GuardMediaBody(BaseModel):
+    image_b64: str
+    metadata: Dict[str, Any] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -369,43 +383,52 @@ async def guard_tool(session_id: str, body: GuardToolBody):
     block_reason: Optional[str] = None
     total_ms = 0
 
-    # ── Phase 1: Deterministic Sandbox ─────────────────────────────────────
-    t1 = time.perf_counter()
-    ph1_blocked, ph1_reason = _phase1_sandbox(body.tool_name, body.tool_args)
-    ms1 = int((time.perf_counter() - t1) * 1000)
-    total_ms += ms1
-
-    if ph1_blocked:
+    # ── Tool denylist ───────────────────────────────────────────────────────
+    net = _load_net()
+    tool_denylist = [t.lower() for t in net.get("tool_denylist", [])]
+    if body.tool_name.lower() in tool_denylist:
         blocked = True
-        final_risk = 0.95
-        block_reason = f"Sandbox violation: {ph1_reason}"
-        spans.append(_tool_span("Sandbox", "block", ms1, body.tool_name, ph1_reason))
-    else:
-        spans.append(_tool_span("Sandbox", "pass", ms1, body.tool_name, "Filesystem and network checks passed"))
+        final_risk = 0.9
+        block_reason = f"Tool '{body.tool_name}' is on the denylist"
+        spans.append(_tool_span("Tool denylist", "block", 0, body.tool_name, block_reason))
 
-        # ── Phase 2: Contextual Intent Verifier ────────────────────────────
-        # Skipped silently if no goal has been recorded yet.
-        goal = store.get_original_goal(session_id)
-        if goal:
-            t2 = time.perf_counter()
-            ph2_flagged, flagged_tokens = _phase2_intent(goal, body.tool_name, body.tool_args)
-            ms2 = int((time.perf_counter() - t2) * 1000)
-            total_ms += ms2
+    if not blocked:
+        # ── Phase 1: Deterministic Sandbox ─────────────────────────────────
+        t1 = time.perf_counter()
+        ph1_blocked, ph1_reason = _phase1_sandbox(body.tool_name, body.tool_args)
+        ms1 = int((time.perf_counter() - t1) * 1000)
+        total_ms += ms1
 
-            if ph2_flagged:
-                blocked = True
-                final_risk = 0.75
-                block_reason = (
-                    f"Intent mismatch: {', '.join(t[:40] for t in flagged_tokens[:3])}"
-                )
-                spans.append(_tool_span(
-                    "Intent verification", "block", ms2, body.tool_name,
-                    f"Flagged tokens: {', '.join(t[:40] for t in flagged_tokens[:3])}",
-                ))
-            else:
-                spans.append(_tool_span("Intent verification", "pass", ms2, body.tool_name, "No unauthorized tokens"))
+        if ph1_blocked:
+            blocked = True
+            final_risk = 0.95
+            block_reason = f"Sandbox violation: {ph1_reason}"
+            spans.append(_tool_span("Sandbox", "block", ms1, body.tool_name, ph1_reason))
         else:
-            final_risk = 0.0
+            spans.append(_tool_span("Sandbox", "pass", ms1, body.tool_name, "Filesystem and network checks passed"))
+
+            # ── Phase 2: Contextual Intent Verifier ────────────────────────
+            goal = store.get_original_goal(session_id)
+            if goal:
+                t2 = time.perf_counter()
+                ph2_flagged, flagged_tokens = _phase2_intent(goal, body.tool_name, body.tool_args)
+                ms2 = int((time.perf_counter() - t2) * 1000)
+                total_ms += ms2
+
+                if ph2_flagged:
+                    blocked = True
+                    final_risk = 0.75
+                    block_reason = (
+                        f"Intent mismatch: {', '.join(t[:40] for t in flagged_tokens[:3])}"
+                    )
+                    spans.append(_tool_span(
+                        "Intent verification", "block", ms2, body.tool_name,
+                        f"Flagged tokens: {', '.join(t[:40] for t in flagged_tokens[:3])}",
+                    ))
+                else:
+                    spans.append(_tool_span("Intent verification", "pass", ms2, body.tool_name, "No unauthorized tokens"))
+            else:
+                final_risk = 0.0
 
     # ---- Fold into active trace ------------------------------------------------
     active = store.get_active_trace(session_id)
@@ -501,15 +524,40 @@ async def guard_output(session_id: str, body: GuardOutputBody):
         traces = store.get_traces(session_id)
         active = next((t for t in traces if t["trace_id"] == body.trace_id), None)
 
+    # Phase 3: PII detection — runs even when output is clean (to redact without blocking)
+    pii_result = {"should_block": False, "block_reason": None, "redacted_text": body.content, "entities": []}
+    redacted_content = None
+    if not body.trust and not blocked:
+        t_pii = time.perf_counter()
+        pii_result = pii_detector.scan(body.content)
+        pii_ms = int((time.perf_counter() - t_pii) * 1000)
+        duration_ms += pii_ms
+        if pii_result["should_block"]:
+            blocked = True
+            reason = pii_result["block_reason"]
+            verdict = "blocked"
+            pii_detail = f"BLOCK · {reason}"
+        elif pii_result["entities"]:
+            pii_detail = f"Redacted {len(pii_result['entities'])} PII entities"
+            redacted_content = pii_result["redacted_text"]
+        else:
+            pii_detail = "No PII detected"
+        spans_pii = [_span("PII scan", "block" if pii_result["should_block"] else "pass", pii_ms, pii_detail)]
+    else:
+        spans_pii = []
+
+    final_content = body.content[:4000]
+
     if active:
         active["spans"].append(
             _span("Output gate", "block" if blocked else "pass", duration_ms, output_detail)
         )
+        active["spans"].extend(spans_pii)
         active["verdict"] = verdict
         active["severity"] = _severity(max(active.get("risk_score", 0.0), output_score))
         active["risk_score"] = round(max(active.get("risk_score", 0.0), output_score), 4)
         active["duration_ms"] = active.get("duration_ms", 0) + duration_ms
-        active["llm_output"] = body.content[:4000]
+        active["llm_output"] = final_content
         active["finalized"] = True
         store.update_trace(active)
         store.clear_active_trace(session_id)
@@ -529,11 +577,12 @@ async def guard_output(session_id: str, body: GuardOutputBody):
             "duration_ms": duration_ms,
             "spans": [
                 _span("Output gate", "block" if blocked else "pass", duration_ms,
-                      f"score={output_score:.3f}" if blocked else "Clean")
+                      f"score={output_score:.3f}" if blocked else "Clean"),
+                *spans_pii,
             ],
             "llm_tokens": None,
             "llm_model": None,
-            "llm_output": body.content[:4000],
+            "llm_output": final_content,
             "finalized": True,
         }
         store.log_trace(trace)
@@ -545,6 +594,88 @@ async def guard_output(session_id: str, body: GuardOutputBody):
         "blocked": blocked,
         "block_reason": reason,
         "output_score": round(output_score, 4),
+        "redacted_content": redacted_content,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Guard — media
+# ---------------------------------------------------------------------------
+
+@router.post("/sessions/{session_id}/guard/media")
+async def guard_media(session_id: str, body: GuardMediaBody):
+    _require_session(session_id)
+    t_start = time.perf_counter()
+
+    try:
+        image_data = base64.b64decode(body.image_b64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 image data")
+
+    spans = []
+    blocked = False
+    block_reason = None
+
+    # Phase 1: NSFW classification
+    t1 = time.perf_counter()
+    nsfw_result = nsfw_detector.is_nsfw(image_data)
+    ms1 = int((time.perf_counter() - t1) * 1000)
+    if nsfw_result["nsfw"]:
+        blocked = True
+        block_reason = f"NSFW content detected (score={nsfw_result['score']:.2f})"
+        spans.append(_span("NSFW check", "block", ms1, block_reason))
+    else:
+        spans.append(_span("NSFW check", "pass", ms1, f"score={nsfw_result['score']:.3f}"))
+
+    # Phase 2: OCR + injection check
+    if not blocked:
+        t2 = time.perf_counter()
+        ocr_text = nsfw_detector.extract_text(image_data)
+        ms2 = int((time.perf_counter() - t2) * 1000)
+        if ocr_text.strip():
+            indirect_match = _INDIRECT_INJECTION_PATTERNS.search(ocr_text)
+            if indirect_match:
+                blocked = True
+                block_reason = f"Prompt injection in image text: '{indirect_match.group(0)[:60]}'"
+                spans.append(_span("OCR injection check", "block", ms2, block_reason))
+            else:
+                clf = classifier.classify(ocr_text)
+                if clf["score"] > THRESHOLD:
+                    blocked = True
+                    block_reason = f"Suspicious text in image (score={clf['score']:.3f})"
+                    spans.append(_span("OCR injection check", "block", ms2, block_reason))
+                else:
+                    spans.append(_span("OCR injection check", "pass", ms2, f"score={clf['score']:.3f}"))
+        else:
+            spans.append(_span("OCR injection check", "pass", 0, "No text detected"))
+
+    duration_ms = int((time.perf_counter() - t_start) * 1000)
+    verdict = "blocked" if blocked else "allowed"
+    risk = 0.95 if blocked else 0.0
+
+    trace = {
+        "trace_id": uuid.uuid4().hex,
+        "session_id": session_id,
+        "ts": time.time(),
+        "ts_readable": datetime.now().strftime("%H:%M:%S"),
+        "prompt": "[media:image]",
+        "verdict": verdict,
+        "severity": _severity(risk),
+        "risk_score": round(risk, 4),
+        "duration_ms": duration_ms,
+        "spans": spans,
+        "llm_tokens": None,
+        "llm_model": None,
+        "finalized": True,
+    }
+    store.log_trace(trace)
+    await publish(session_id, trace)
+
+    return {
+        "trace_id": trace["trace_id"],
+        "allowed": not blocked,
+        "blocked": blocked,
+        "block_reason": block_reason,
     }
 
 
@@ -666,5 +797,33 @@ def remove_denylist(domain: str):
         e for e in entries
         if (e.get("domain") if isinstance(e, dict) else e) != domain
     ]
+    _save_net(net)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Tool denylist
+# ---------------------------------------------------------------------------
+
+@router.get("/tools/denylist")
+def get_tool_denylist():
+    net = _load_net()
+    return {"tools": net.get("tool_denylist", [])}
+
+
+@router.post("/tools/denylist")
+def add_tool_denylist(body: ToolDenyBody):
+    net = _load_net()
+    tools = net.setdefault("tool_denylist", [])
+    if body.tool_name.lower() not in [t.lower() for t in tools]:
+        tools.append(body.tool_name.lower())
+        _save_net(net)
+    return {"ok": True}
+
+
+@router.delete("/tools/denylist/{tool_name}")
+def remove_tool_denylist(tool_name: str):
+    net = _load_net()
+    net["tool_denylist"] = [t for t in net.get("tool_denylist", []) if t.lower() != tool_name.lower()]
     _save_net(net)
     return {"ok": True}

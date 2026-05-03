@@ -20,6 +20,7 @@ const plugin = {
     const enforceInputGate = toBool(cfg.enforceInputGate, true);
     const enforceOutputGate = toBool(cfg.enforceOutputGate, true);
     const enforceToolGate = toBool(cfg.enforceToolGate, true);
+    const enforceMediaGate = toBool(cfg.enforceMediaGate, true);
 
     // -----------------------------------------------------------------------
     // State
@@ -37,6 +38,8 @@ const plugin = {
     const inputBlockedReasons = new Map<string, string>();
     /** refusal message to deliver in message_sending for blocked-input turns */
     const inputBlockedReplace = new Map<string, string>();
+    /** PII-redacted content to substitute in message_sending */
+    const pendingRedactions = new Map<string, string>();
 
     // -----------------------------------------------------------------------
     // HTTP helpers
@@ -209,19 +212,64 @@ const plugin = {
     // OpenClaw startup detection
     // -----------------------------------------------------------------------
 
-    /** Bootstrap file reads on session start — skip guard to avoid noise */
-    function isBootstrapRead(toolName: string, toolArgs: Record<string, unknown>): boolean {
+    /** Internal OpenClaw operations — skip gate entirely, never show in traces */
+    function isInternalOperation(toolName: string, toolArgs: Record<string, unknown>): boolean {
       const name = toolName.trim().toLowerCase();
-      if (!["read", "filesystem_read"].includes(name)) return false;
-      const path = String(toolArgs.file_path || toolArgs.path || toolArgs.from || "").toLowerCase();
-      return path.includes("/.openclaw/workspace/") &&
-        /(soul\.md|user\.md|memory\.md|identity\.md|bootstrap\.md)$/.test(path);
+
+      // Memory tools are always internal
+      if (name.startsWith("memory_") || name === "memory") return true;
+
+      // Resolve any path/command argument
+      const pathArg = String(
+        toolArgs.file_path || toolArgs.path || toolArgs.from ||
+        toolArgs.to || toolArgs.filename || ""
+      ).toLowerCase();
+      const cmdArg = String(toolArgs.command || toolArgs.cmd || "").toLowerCase();
+      const combined = pathArg + " " + cmdArg;
+
+      // Anything touching the OpenClaw workspace or config dirs
+      if (combined.includes("/.openclaw/")) return true;
+
+      // Named workspace files referenced by filename only (no full path)
+      const filename = pathArg.split("/").pop() || pathArg;
+      if (/^(soul|user|memory|identity|bootstrap)\.md$/.test(filename)) return true;
+
+      return false;
     }
 
-    /** Startup prompts OpenClaw sends internally — skip guard */
+    /** Extract base64-encoded images from the latest user message */
+    function extractImages(event: any): string[] {
+      const images: string[] = [];
+      const messages: any[] = Array.isArray(event?.messages) ? event.messages : [];
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        const role = String(msg?.role || msg?.type || "").toLowerCase();
+        if (role !== "user") continue;
+        const content = msg?.content;
+        if (!Array.isArray(content)) break;
+        for (const part of content) {
+          if (part?.type === "image_url") {
+            const url = String(part?.image_url?.url || "");
+            if (url.startsWith("data:image/")) {
+              const b64 = url.split(",")[1];
+              if (b64) images.push(b64);
+            }
+          } else if (part?.type === "image" && part?.source?.type === "base64") {
+            if (part.source.data) images.push(String(part.source.data));
+          }
+        }
+        break; // only inspect the latest user message
+      }
+      return images;
+    }
+
+    /** Startup prompts and greetings OpenClaw sends internally — skip guard */
     function isStartupPrompt(text: string): boolean {
-      return /\bA new session was started via \/new or \/reset\./i.test(text) ||
-        /^based on this conversation,\s*generate.*filename slug/i.test(text);
+      const t = text.trim();
+      return /\bA new session was started via \/new or \/reset\./i.test(t) ||
+        /^based on this conversation,\s*generate.*filename slug/i.test(t) ||
+        // OpenClaw session-start greeting (fires before any user prompt)
+        /^hey[.,!]?\s*(i'?m|i am)\s+\w+[.,!]?\s*(what'?s\s+(on your mind|up)\??)?$/i.test(t);
     }
 
     function assistantText(event: any, texts: string[]): string {
@@ -253,6 +301,7 @@ const plugin = {
       inputBlockedSessions.clear();
       inputBlockedReasons.clear();
       inputBlockedReplace.clear();
+      pendingRedactions.clear();
       api.logger.info("[aegis-guard] all session state cleared on reset");
     });
 
@@ -266,6 +315,30 @@ const plugin = {
 
         const sid = await resolveSession(event, ctx, `llm:${llmKey(event, ctx)}`);
         bind(sid, event, ctx);
+
+        // Media gate — check images before text input gate
+        if (enforceMediaGate) {
+          const images = extractImages(event);
+          for (const image_b64 of images) {
+            try {
+              const mediaResult = await post(`/sessions/${sid}/guard/media`, {
+                image_b64,
+                metadata: { source: "openclaw-plugin", hook: "before_prompt_build", environment },
+              });
+              if (mediaResult?.blocked) {
+                const reason = String(mediaResult?.block_reason || "image content policy violation");
+                api.logger.warn(`[aegis-guard] media blocked sid=${sid} reason=${reason}`);
+                inputBlockedSessions.add(sid);
+                inputBlockedReasons.set(sid, reason);
+                return {
+                  systemPrompt: `You are a helpful and safe AI assistant. An image in the user's message was blocked by a security guardrail. Reason: ${reason}. In 1–2 sentences, explain naturally that you cannot process that image.`,
+                };
+              }
+            } catch (err) {
+              api.logger.warn(`[aegis-guard] media gate error: ${String(err)}`);
+            }
+          }
+        }
 
         const result = await post(`/sessions/${sid}/guard/input`, {
           content,
@@ -298,8 +371,8 @@ const plugin = {
         const toolName = String(event?.toolName || "");
         const toolArgs = (event?.params || {}) as Record<string, unknown>;
 
-        // Skip bootstrap reads — these are OpenClaw startup internals, not user-driven
-        if (isBootstrapRead(toolName, toolArgs)) return undefined;
+        // Skip internal OpenClaw operations — workspace reads/writes, memory tools, etc.
+        if (isInternalOperation(toolName, toolArgs)) return undefined;
 
         // Only gate tool calls within an existing session (created by before_prompt_build).
         // Tool calls before any user prompt are internal OpenClaw operations — skip them.
@@ -349,10 +422,7 @@ const plugin = {
         const prompt = String(event?.prompt || "");
         if (isStartupPrompt(prompt) || isStartupPrompt(content)) return;
 
-        // Only gate output within an existing session — greetings and internal LLM
-        // responses that have no corresponding user prompt should not create sessions.
-        const sid = findSession(event, ctx, `llm:${llmKey(event, ctx)}`);
-        if (!sid) return;
+        const sid = await resolveSession(event, ctx, `llm:${llmKey(event, ctx)}`);
         bind(sid, event, ctx);
 
         const traceId = pendingTraceIds.get(sid);
@@ -387,8 +457,11 @@ const plugin = {
         if (result?.blocked) {
           const reason = String(result?.block_reason || "safety policy violation");
           const replacement = `I'm not able to share that response. Reason: ${reason}.`;
-          assistantTexts.splice(0, assistantTexts.length, replacement);
+          pendingRedactions.set(sid, replacement);
           api.logger.warn(`[aegis-guard] output blocked sid=${sid} score=${result?.output_score ?? "?"} reason=${reason}`);
+        } else if (result?.redacted_content && result.redacted_content !== content) {
+          pendingRedactions.set(sid, result.redacted_content);
+          api.logger.info(`[aegis-guard] PII redacted in output sid=${sid}`);
         }
       } catch (err) {
         api.logger.warn(`[aegis-guard] llm_output: ${String(err)}`);
@@ -402,10 +475,12 @@ const plugin = {
         const content = String(event?.content || "");
         if (!content.trim()) return undefined;
 
-        // Only gate output within an existing session — startup greetings and other
-        // internal messages that have no corresponding user prompt should be skipped.
-        const sid = findSession(event, ctx, msgKey(ctx));
-        if (!sid) return undefined;
+        // Skip startup greetings — these fire before any user prompt and would
+        // create orphan sessions. isStartupPrompt covers known patterns; the
+        // guardedOutputTurns / pendingTraceIds checks handle real turns.
+        if (isStartupPrompt(content)) return undefined;
+
+        const sid = await resolveSession(event, ctx, msgKey(ctx));
         bind(sid, event, ctx);
 
         // Input-blocked turns: force the hardcoded refusal regardless of LLM output.
@@ -417,9 +492,14 @@ const plugin = {
           return { content: refusal };
         }
 
-        // llm_output already guarded this turn — skip to avoid duplicate trace
+        // llm_output already guarded this turn — apply any pending redaction or skip
         if (guardedOutputTurns.has(sid)) {
           guardedOutputTurns.delete(sid);
+          if (pendingRedactions.has(sid)) {
+            const redacted = pendingRedactions.get(sid)!;
+            pendingRedactions.delete(sid);
+            return { content: redacted };
+          }
           return undefined;
         }
 
@@ -436,6 +516,10 @@ const plugin = {
           const reason = String(result?.block_reason || "safety policy violation");
           api.logger.warn(`[aegis-guard] outbound blocked sid=${sid} score=${result?.output_score ?? "?"} reason=${reason}`);
           return { content: `I'm not able to share that response. Reason: ${reason}.` };
+        }
+        if (result?.redacted_content && result.redacted_content !== content) {
+          api.logger.info(`[aegis-guard] PII redacted in outbound sid=${sid}`);
+          return { content: result.redacted_content };
         }
       } catch (err) {
         api.logger.warn(`[aegis-guard] message_sending: ${String(err)}`);
