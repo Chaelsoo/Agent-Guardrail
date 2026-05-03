@@ -1,0 +1,16 @@
+services:
+  aegis:
+    build: .
+    ports:
+      - "8765:8765"
+    volumes:
+      - hf_cache:/cache/huggingface
+      - aegis_data:/data
+    environment:
+      - AEGIS_THRESHOLD=${AEGIS_THRESHOLD:-0.5}
+      - HF_TOKEN=${HF_TOKEN}
+    restart: unless-stopped
+
+volumes:
+  hf_cache:
+  aegis_data:

@@ -1,0 +1,8 @@
+# Aegis deployment configuration
+# Change agent_type to switch the active policy profile.
+# Options: general | pentest | code_execution | data_retrieval | customer_support
+
+agent_type: general
+environment: dev
+role: user
+tenant_id: null
