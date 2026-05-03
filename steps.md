@@ -2,7 +2,6 @@
 
 **prerequisites:** Docker, Node.js 22+, a HuggingFace account with access to [qualifire/prompt-injection-sentinel](https://huggingface.co/qualifire/prompt-injection-sentinel)
 
----
 
 **1. clone the repo**
 
@@ -11,7 +10,6 @@ git clone https://github.com/Chaelsoo/Agent-Guardrail.git
 cd Agent-Guardrail
 ```
 
----
 
 **2. start aegis**
 
@@ -37,7 +35,6 @@ docker compose logs -f aegis
 
 dashboard → http://localhost:8765
 
----
 
 **3. install openclaw**
 
@@ -51,7 +48,6 @@ follow the setup wizard to connect your channels (Telegram, etc.) and configure 
 openclaw gateway --force
 ```
 
----
 
 **4. install the aegis plugin**
 
@@ -85,7 +81,6 @@ restart the gateway to load the plugin:
 openclaw gateway --force
 ```
 
----
 
 **5. verify**
 
