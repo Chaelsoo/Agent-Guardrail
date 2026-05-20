@@ -1,6 +1,6 @@
 # setup
 
-**prerequisites:** Docker, Node.js 22+, a HuggingFace account with access to [qualifire/prompt-injection-sentinel](https://huggingface.co/qualifire/prompt-injection-sentinel)
+**prerequisites:** Docker, Node.js 22+ (optional for OpenClaw)
 
 
 **1. clone the repo**
@@ -11,29 +11,51 @@ cd Agent-Guardrail
 ```
 
 
-**2. start aegis**
+**2. configure environment**
 
-add your HuggingFace token to `docker-compose.yml`:
-
-```yaml
-environment:
-  - HF_TOKEN=hf_your_token_here
-```
-
-then:
+create a `.env` file in the root directory (or get it from your teammate):
 
 ```bash
-docker compose up -d --build
+# Aegis Configuration
+AEGIS_THRESHOLD=0.5
+
+# LLM Judge - DeepSeek (get key from https://platform.deepseek.com/)
+LLM_JUDGE_API_KEY=your_deepseek_api_key_here
+LLM_JUDGE_MODEL=deepseek-chat
+LLM_JUDGE_PROVIDER=deepseek
+JUDGE_AUDIT_INTERVAL=3
+TAINT_RESOLUTION_THRESHOLD=2
+
+# Database
+DATABASE_URL=sqlite:///aegis.db
+AEGIS_DB_ENABLED=true
+
+# Optional: HuggingFace token (only needed for gated models)
+HF_TOKEN=
 ```
 
-first run downloads ~2.5 GB of models into a persistent volume — subsequent starts are instant. wait until ready:
+
+**3. start aegis**
 
 ```bash
-docker compose logs -f aegis
+docker-compose up --build
+```
+
+first run downloads models (~2.5 GB) — subsequent starts are instant. wait until ready:
+
+```bash
+docker-compose logs -f aegis
 # ready when you see: [Aegis] All models ready
 ```
 
-dashboard → http://localhost:8765
+**dashboard** → http://localhost:8765
+
+
+**features:**
+- ✅ **DeepSeek Judge**: LLM-based security monitoring (Job A: per-action, Job B: periodic audit)
+- ✅ **PoLP Profiles**: Granular tool access control with path/domain restrictions (see Tools page)
+- ✅ **Session Management**: Clean trace grouping and finalization
+- ✅ **All Gates**: Input, Tool, Tool Output, Output with real-time monitoring
 
 
 **3. install openclaw**
