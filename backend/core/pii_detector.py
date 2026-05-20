@@ -49,23 +49,14 @@ class PIIDetector:
             for r in results
         ]
 
-        block_ents = [e for e in entities if e["type"].upper() in BLOCK_ENTITIES]
-        should_block = bool(block_ents)
-        block_reason = (
-            f"Output contains critical PII: {', '.join(sorted({e['type'] for e in block_ents}))}"
-            if should_block
-            else None
-        )
-
-        # Redact all PII spans in reverse order to preserve character offsets
+        # Redact ALL detected PII - no blocking, just redaction
         redacted = text
         for e in sorted(entities, key=lambda x: x["start"], reverse=True):
-            if e["type"].upper() in REDACT_ENTITIES:
-                redacted = redacted[: e["start"]] + f"[{e['type']}]" + redacted[e["end"] :]
+            redacted = redacted[: e["start"]] + "[REDACTED]" + redacted[e["end"] :]
 
         return {
-            "should_block": should_block,
-            "block_reason": block_reason,
+            "should_block": False,  # Never block, always redact
+            "block_reason": None,
             "redacted_text": redacted,
             "entities": entities,
         }

@@ -5,10 +5,15 @@ services:
       - "8765:8765"
     volumes:
       - hf_cache:/cache/huggingface
-      - aegis_data:/data
+      - ./aegis_data:/app/aegis_data
     environment:
       - AEGIS_THRESHOLD=${AEGIS_THRESHOLD:-0.5}
       - HF_TOKEN=${HF_TOKEN}
+      - LLM_JUDGE_API_KEY=${LLM_JUDGE_API_KEY}
+      - LLM_JUDGE_MODEL=${LLM_JUDGE_MODEL:-llama-3.1-8b-instant}
+      - LLM_JUDGE_PROVIDER=${LLM_JUDGE_PROVIDER:-auto}
+      - JUDGE_AUDIT_INTERVAL=${JUDGE_AUDIT_INTERVAL:-3}
+      - TAINT_RESOLUTION_THRESHOLD=${TAINT_RESOLUTION_THRESHOLD:-2}
     restart: unless-stopped
 
 volumes:

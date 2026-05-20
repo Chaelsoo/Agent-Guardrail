@@ -1,5 +1,9 @@
 from sentence_transformers import CrossEncoder
 
+# Conservative char limit: ~512 tokens at ~1.7 chars/token.
+# Prevents silent truncation inside the model which would skew entailment scores.
+_MAX_CHARS = 900
+
 
 class NLIVerifier:
     def __init__(self):
@@ -10,17 +14,19 @@ class NLIVerifier:
 
     def verify(self, premise: str, hypothesis: str) -> dict:
         """
-        Returns scores for [contradiction, neutral, entailment].
-        The cross-encoder/nli-deberta-v3-small label order is:
-        index 0 = contradiction, 1 = neutral, 2 = entailment.
+        Returns softmax scores for the NLI labels.
+        cross-encoder/nli-deberta-v3-small id2label: 0=contradiction, 1=entailment, 2=neutral.
         """
         if self.model is None:
             raise RuntimeError("NLIVerifier not loaded")
-        scores = self.model.predict([(premise, hypothesis)], apply_softmax=True)[0]
+        scores = self.model.predict(
+            [(premise[:_MAX_CHARS], hypothesis[:_MAX_CHARS])],
+            apply_softmax=True,
+        )[0]
         return {
             "contradiction": float(scores[0]),
-            "neutral": float(scores[1]),
-            "entailment": float(scores[2]),
+            "entailment": float(scores[1]),
+            "neutral": float(scores[2]),
         }
 
 

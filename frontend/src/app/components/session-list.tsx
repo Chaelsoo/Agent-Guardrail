@@ -1,5 +1,6 @@
 import { Session } from '../types';
 import { SeverityBadge } from './severity-badge';
+import { StateBadge } from './state-badge';
 import { AgentIcon } from './agent-icon';
 import { formatDistanceToNow } from 'date-fns';
 
@@ -48,7 +49,10 @@ export function SessionList({ sessions, selectedSessionId, onSelectSession }: Se
                   {agentTypeLabels[session.agentType]}
                 </span>
               </div>
-              <SeverityBadge severity={session.severity} />
+              <div className="flex items-center gap-1.5">
+                {session.state && <StateBadge state={session.state} />}
+                <SeverityBadge severity={session.severity} />
+              </div>
             </div>
             
             <div className="flex items-center justify-between text-[11px] text-[#94a3b8]">

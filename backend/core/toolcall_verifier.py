@@ -17,14 +17,16 @@ class ToolCallVerifier:
 
     def verify(self, tool_text: str) -> dict:
         """
-        Returns {layer1_flagged, flagged_tokens}.
+        Returns {layer1_flagged, flagged_tokens, token_scores}.
         Runs token classification on the raw tool_text string and collects
         any tokens labelled UNAUTHORIZED (BIO prefix stripped).
+        token_scores is a list of (token, score) tuples.
         """
         if self.pipe is None:
             raise RuntimeError("ToolCallVerifier not loaded")
         results = self.pipe(tool_text)
         flagged = []
+        token_scores = []
         for r in results:
             label = str(r.get("entity_group", r.get("entity", ""))).upper()
             for prefix in ("B-", "I-"):
@@ -32,10 +34,14 @@ class ToolCallVerifier:
                     label = label[len(prefix):]
                     break
             if label == "UNAUTHORIZED":
-                flagged.append(r.get("word", "").strip())
+                token = r.get("word", "").strip()
+                score = float(r.get("score", 0.0))
+                flagged.append(token)
+                token_scores.append((token, score))
         return {
             "layer1_flagged": bool(flagged),
             "flagged_tokens": flagged,
+            "token_scores": token_scores,
         }
 
 

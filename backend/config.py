@@ -15,11 +15,19 @@ class Settings:
     cors_origins: List[str]
     # Detection
     aegis_threshold: float
-    aegis_trajectory_weight: float
-    aegis_flag_threshold: float
+    output_block_threshold: float
+    output_flag_threshold: float
+    # LLM Judge
+    judge_enabled: bool
+    judge_api_key: str
+    judge_model: str
+    judge_provider: str
+    judge_audit_interval: int
+    taint_resolution_threshold: int
 
 
 def load_settings() -> Settings:
+    judge_api_key = os.getenv("LLM_JUDGE_API_KEY", "").strip()
     return Settings(
         fail_closed=os.getenv("AEGIS_FAIL_CLOSED", "false").lower() in ("1", "true", "yes"),
         db_enabled=os.getenv("AEGIS_DB_ENABLED", "true").lower() in ("1", "true", "yes"),
@@ -30,8 +38,14 @@ def load_settings() -> Settings:
         ),
         cors_origins=os.getenv("AEGIS_CORS_ORIGINS", "*").split(","),
         aegis_threshold=float(os.getenv("AEGIS_THRESHOLD", "0.5")),
-        aegis_trajectory_weight=float(os.getenv("AEGIS_TRAJECTORY_WEIGHT", "0.3")),
-        aegis_flag_threshold=float(os.getenv("AEGIS_FLAG_THRESHOLD", "0.3")),
+        output_block_threshold=float(os.getenv("OUTPUT_BLOCK_THRESHOLD", "0.75")),
+        output_flag_threshold=float(os.getenv("OUTPUT_FLAG_THRESHOLD", "0.5")),
+        judge_enabled=bool(judge_api_key),
+        judge_api_key=judge_api_key,
+        judge_model=os.getenv("LLM_JUDGE_MODEL", "openai/gpt-4o-mini"),
+        judge_provider=os.getenv("LLM_JUDGE_PROVIDER", "auto"),
+        judge_audit_interval=int(os.getenv("JUDGE_AUDIT_INTERVAL", "3")),
+        taint_resolution_threshold=int(os.getenv("TAINT_RESOLUTION_THRESHOLD", "2")),
     )
 
 

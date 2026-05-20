@@ -32,21 +32,22 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def startup():
         from ..core.classifier import classifier
-        from ..core.embedder import embedder
         from ..core.toolcall_verifier import toolcall_verifier
         from ..core.pii_detector import pii_detector
-        from ..core.nsfw_detector import nsfw_detector
+        # from ..core.nsfw_detector import nsfw_detector  # Temporarily disabled
         print("[Aegis] Loading classifier (qualifire/prompt-injection-sentinel)...")
         classifier.load()
-        print("[Aegis] Loading embedder (all-MiniLM-L6-v2)...")
-        embedder.load()
         print("[Aegis] Loading tool call verifier (llm-semantic-router/toolcall-verifier)...")
         toolcall_verifier.load()
         print("[Aegis] Loading PII detector (iiiorg/piiranha-v1-detect-personal-information)...")
         pii_detector.load()
-        print("[Aegis] Loading NSFW detector (Falconsai/nsfw_image_detection)...")
-        nsfw_detector.load()
-        print("[Aegis] All models ready")
+        # print("[Aegis] Loading NSFW detector (Falconsai/nsfw_image_detection)...")
+        # nsfw_detector.load()
+        print("[Aegis] All models ready (media gate temporarily disabled)")
+        if not settings.judge_enabled:
+            print("[Aegis] LLM judge disabled — LLM_JUDGE_API_KEY not set")
+        else:
+            print(f"[Aegis] LLM judge enabled — model: {settings.judge_model}")
         print_startup_summary()
 
     return app

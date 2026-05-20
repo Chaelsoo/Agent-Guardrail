@@ -15,14 +15,14 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from urllib.parse import urlparse
+import yaml
 
 from ..config import settings
 from ..core.classifier import classifier
-from ..core.embedder import embedder
 from ..core.toolcall_verifier import toolcall_verifier
 from ..core.pii_detector import pii_detector
-from ..core.nsfw_detector import nsfw_detector
-from ..core.trajectory import compute_trajectory_score, update_trajectory
+# from ..core.nsfw_detector import nsfw_detector  # Temporarily disabled
+from ..core.llm_judge import get_judge, sanitize_history
 from ..storage.session import get_store, publish, _severity
 
 router = APIRouter()
@@ -30,28 +30,16 @@ router = APIRouter()
 store = get_store()
 
 THRESHOLD = settings.aegis_threshold
-TRAJECTORY_WEIGHT = settings.aegis_trajectory_weight
 
-# Output gate uses a separate, much higher threshold.
-# The input jailbreak classifier produces many false positives on normal LLM responses
-# (e.g., "Could you clarify?" scores high). We only trigger the ML check for near-certain
-# indirect injections; regex rules catch the common injection patterns reliably.
-OUTPUT_ML_THRESHOLD = 0.97
-
-# Patterns that indicate indirect prompt injection embedded in tool results or retrieved content.
-import re as _re
-_INDIRECT_INJECTION_PATTERNS = _re.compile(
-    r"ignore (previous|prior|all|your) instructions?"
-    r"|disregard (the |your )?(system |previous |prior )?instructions?"
-    r"|forget (everything|all instructions|your instructions)"
-    r"|new instructions?:"
-    r"|\bsystem prompt\b.{0,30}(override|replace|ignore|disregard)"
-    r"|\[SYSTEM\]|\[INST\]|\[OVERRIDE\]"
-    r"|<\|system\|>|<\|im_start\|>"
-    r"|\{\{.*?(inject|prompt|override).*?\}\}"
-    r"|you are now|your new (role|persona|identity|instructions?) (is|are)",
-    _re.IGNORECASE | _re.DOTALL,
-)
+# Load PoLP profile
+_POLP_PROFILE = {}
+_polp_path = Path(__file__).resolve().parent.parent.parent / "aegis_data" / "polp_profile.yaml"
+if _polp_path.exists():
+    with open(_polp_path) as f:
+        _POLP_PROFILE = yaml.safe_load(f) or {}
+    print(f"[Aegis] Loaded PoLP profile with {len(_POLP_PROFILE)} tool rules")
+else:
+    print("[Aegis] No PoLP profile found — all tools allowed")
 
 # ---------------------------------------------------------------------------
 # Network config persistence
@@ -123,6 +111,12 @@ class GuardMediaBody(BaseModel):
     metadata: Dict[str, Any] = {}
 
 
+class GuardToolOutputBody(BaseModel):
+    tool_name: str
+    tool_output: str
+    metadata: Dict[str, Any] = {}
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -130,6 +124,170 @@ class GuardMediaBody(BaseModel):
 def _require_session(session_id: str) -> None:
     if not store.exists(session_id):
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+
+    # COMPROMISED dead-stop: reject all requests
+    state = store.get_state(session_id)
+    if state == "COMPROMISED":
+        raise HTTPException(
+            status_code=403,
+            detail="Session is COMPROMISED. All requests blocked."
+        )
+
+
+def is_new_task(message: str, session_id: str) -> bool:
+    """
+    Detect task boundary using three signals.
+    Conservative: all three must be true to checkpoint.
+    """
+    # Signal 1: Message doesn't reference current conversation context
+    tool_history = store.get_tool_history(session_id)
+    no_reference = not _references_current_context(message, tool_history)
+
+    # Signal 2: Previous agent response was conclusive
+    last_response = store.get_session(session_id)
+    # For now, we don't track last_agent_response, so assume conclusive if tool_history exists
+    # This is a simplification - proper implementation would track agent responses
+    was_conclusive = len(tool_history) > 0  # Simplified
+
+    # Signal 3: Sentinel score is low (genuine new request, not injection)
+    clf_result = classifier.classify(message)
+    sentinel_score = clf_result["score"]
+    is_genuine = sentinel_score < 0.2
+
+    # All three together → checkpoint
+    return no_reference and was_conclusive and is_genuine
+
+
+def _apply_judge_verdict(session_id: str, verdict: Dict[str, Any]) -> None:
+    """
+    Apply judge verdict to session state and update trace.
+
+    Job A verdicts:
+    - ALIGNED → increment taint.consecutive_aligned if tainted
+    - UNCERTAIN → session → FLAGGED, reset consecutive_aligned
+    - HIJACKED → session → COMPROMISED, trace verdict → hijacked
+
+    Job B verdicts:
+    - ALIGNED → no action
+    - DRIFTED → session → FLAGGED
+    - HIJACKED → session → COMPROMISED
+    """
+    verdict_type = verdict.get("verdict", "UNCERTAIN")
+    job = verdict.get("job", "A")
+
+    if verdict_type == "HIJACKED":
+        store.set_state(session_id, "COMPROMISED")
+        print(f"[Aegis] Session COMPROMISED by judge (Job {job})")
+
+        # Update the trace verdict retroactively
+        traces = store.get_traces(session_id)
+        if traces:
+            latest_trace = traces[-1]
+            # Only update if it was originally allowed (don't override blocked verdicts)
+            if latest_trace.get("verdict") == "allowed":
+                latest_trace["verdict"] = "hijacked"
+                latest_trace["severity"] = "Critical"
+                latest_trace["risk_score"] = 0.95
+                store.update_trace(latest_trace)
+                print(f"[Aegis] Trace {latest_trace.get('trace_id')[:8]} verdict updated: allowed → hijacked")
+
+    elif verdict_type == "UNCERTAIN" or verdict_type == "DRIFTED":
+        current_state = store.get_state(session_id)
+        if current_state == "ACTIVE":
+            store.set_state(session_id, "FLAGGED")
+            print(f"[Aegis] Session FLAGGED by judge (Job {job})")
+
+        # Reset taint consecutive counter on UNCERTAIN
+        if verdict_type == "UNCERTAIN":
+            taint = store.get_taint(session_id)
+            if taint.get("active"):
+                taint["consecutive_aligned"] = 0
+                store.set_taint(session_id, taint)
+
+    elif verdict_type == "ALIGNED":
+        # Taint resolution logic (Job A only)
+        if job == "A":
+            taint = store.get_taint(session_id)
+            if taint.get("active"):
+                taint["consecutive_aligned"] += 1
+
+                # Check if taint should be resolved
+                if taint["consecutive_aligned"] >= settings.taint_resolution_threshold:
+                    taint = {
+                        "active": False,
+                        "source_tool": None,
+                        "source_turn": None,
+                        "consecutive_aligned": 0,
+                    }
+                    print(f"[Aegis] Taint resolved after {settings.taint_resolution_threshold} consecutive ALIGNED verdicts")
+
+                store.set_taint(session_id, taint)
+
+
+def _references_current_context(message: str, tool_history: list) -> bool:
+    """Check if message references recent tool calls or conversation context."""
+    if not tool_history:
+        return False
+
+    message_lower = message.lower()
+
+    # Check for references to recent tools
+    recent_tools = [t.get("tool_name", "") for t in tool_history[-3:]]
+    for tool in recent_tools:
+        if tool.lower() in message_lower:
+            return True
+
+    # Check for conversation continuity markers
+    continuation_phrases = ["the", "this", "that", "it", "these", "those",
+                           "above", "previous", "earlier", "before", "already"]
+    # Only consider it referencing if multiple markers present
+    marker_count = sum(1 for phrase in continuation_phrases if phrase in message_lower.split())
+
+    return marker_count >= 2
+
+
+def check_polp(tool_name: str, tool_args: dict) -> tuple[bool, Optional[str]]:
+    """
+    Check PoLP capability profile constraints.
+    Returns (blocked, reason) tuple.
+    """
+    rule = _POLP_PROFILE.get(tool_name)
+    if rule is None:
+        return False, None
+
+    if rule.get("blocked"):
+        return True, f"{tool_name} blocked by PoLP profile"
+
+    # read_file: check allowed_paths
+    if tool_name == "read_file":
+        path = tool_args.get("path", "")
+        allowed = rule.get("allowed_paths", [])
+        if allowed and not any(path.startswith(p) for p in allowed):
+            return True, f"read_file: {path} outside allowed scope"
+
+    # http_request: check domains
+    if tool_name == "http_request":
+        url = tool_args.get("url", "")
+        parsed = urlparse(url)
+        domain = parsed.netloc or parsed.path.split("/")[0]
+
+        blocked_domains = rule.get("blocked_domains", [])
+        if domain in blocked_domains:
+            return True, f"http_request to {domain} blocked"
+
+        allowed_domains = rule.get("allowed_domains", [])
+        if allowed_domains and domain not in allowed_domains:
+            return True, f"http_request to {domain} outside allowed scope"
+
+    # send_email: check recipient domains
+    if tool_name == "send_email":
+        recipient = tool_args.get("to", "")
+        recipient_domain = recipient.split("@")[-1] if "@" in recipient else ""
+        allowed_domains = rule.get("allowed_recipient_domains", [])
+        if allowed_domains and recipient_domain not in allowed_domains:
+            return True, f"send_email to {recipient_domain} outside allowed domains"
+
+    return False, None
 
 
 def _span(name: str, status: str, duration_ms: int, detail: str = None) -> dict:
@@ -252,16 +410,46 @@ def _phase1_sandbox(tool_name: str, tool_args: dict) -> tuple:
     return False, ""
 
 
-def _phase2_intent(goal: str, tool_name: str, tool_args: dict) -> tuple:
-    """Contextual intent check via toolcall-verifier. Returns (flagged: bool, tokens: list)."""
-    combined = f"User Goal: {goal}\nRequested Tool Payload: {tool_name}: {tool_args}"
+def _phase2_intent(goal: str, tool_name: str, tool_args: dict, tool_history: list = None) -> tuple:
+    """
+    Contextual intent check via toolcall-verifier.
+    Returns (flagged: bool, tokens: list).
+
+    Part A: Raised UNCERTAIN bar - require score > 0.75 OR 2+ flagged tokens
+    Part B: Feed tool_history as context for stateful verification
+    """
+    # Build combined text with tool history context
+    # Keep format similar to original to avoid confusing the model
+    combined = f"User Goal: {goal}\n"
+
+    if tool_history:
+        recent = tool_history[-5:]  # Last 5 tool calls
+        history_parts = []
+        for tc in recent:
+            history_parts.append(f"{tc.get('tool_name')}({tc.get('tool_args', {})})")
+        combined += f"Previous: {' -> '.join(history_parts)}\n"
+
+    combined += f"Requested Tool Payload: {tool_name}: {tool_args}"
+
     result = toolcall_verifier.verify(combined)
-    # Discard whole-string false positives: the model sometimes collapses the entire
-    # input into one UNAUTHORIZED span.  A genuine flag targets a specific sub-token,
-    # so we drop any flagged span that covers more than half the combined text.
+
+    # Discard whole-string false positives (filter token_scores by token length)
     threshold_len = len(combined) // 2
-    specific = [t for t in result["flagged_tokens"] if len(t) < threshold_len]
-    return bool(specific), specific
+    token_scores = result.get("token_scores", [])
+    specific = [(token, score) for token, score in token_scores if len(token) < threshold_len]
+
+    if not specific:
+        return False, []
+
+    # Part A: Raised UNCERTAIN bar on filtered tokens
+    # Flag only if: max_score > 0.75 OR 2+ flagged tokens
+    specific_tokens = [t for t, s in specific]
+    specific_scores = [s for t, s in specific]
+    max_score = max(specific_scores) if specific_scores else 0.0
+
+    should_flag = (max_score > 0.75) or (len(specific_tokens) >= 2)
+
+    return should_flag, specific_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -280,8 +468,8 @@ def health():
     return {
         "status": "ok",
         "classifier_loaded": classifier.pipe is not None,
-        "embedder_loaded": embedder.model is not None,
         "toolcall_verifier_loaded": toolcall_verifier.pipe is not None,
+        "pii_detector_loaded": pii_detector.pipe is not None,
         "test_injection_score": round(test_score, 4),
         "phase2_self_test": "pass" if not p2_flagged else "flag",
         "phase2_self_test_expected": "pass",
@@ -307,28 +495,58 @@ async def guard_input(session_id: str, body: GuardInputBody):
         store.clear_active_trace(session_id)
         await publish(session_id, stale)
 
-    # Store the first user message and its embedding as the session's goal (set once only)
+    # Store the first user message as the session's goal (set once only)
     if not store.get_original_goal(session_id):
         store.set_original_goal(session_id, body.content)
 
     clf = classifier.classify(body.content)
     classifier_score = clf["score"]
-    embedding = embedder.encode(body.content)
-
-    trajectory_score = compute_trajectory_score(session_id, embedding)
-    final_score = (1 - TRAJECTORY_WEIGHT) * classifier_score + TRAJECTORY_WEIGHT * trajectory_score
-    update_trajectory(session_id, embedding, classifier_score)
 
     duration_ms = int((time.perf_counter() - t_start) * 1000)
-    blocked = final_score > THRESHOLD
+    blocked = classifier_score > THRESHOLD
     verdict = "blocked" if blocked else "allowed"
 
-    reason = _block_reason(body.content, clf["label"], final_score) if blocked else None
-    gate_detail = (
-        f"label={clf['label']} · classifier={classifier_score:.3f} "
-        f"trajectory={trajectory_score:.3f} · final={final_score:.3f}"
-        + (f" · {reason}" if reason else "")
-    )
+    # Goal checkpointing - detect task boundaries
+    checkpointed = False
+    if not blocked:
+        current_goal = store.get_current_goal(session_id)
+        if current_goal and is_new_task(body.content, session_id):
+            # Close current goal
+            goals = store.get_goals(session_id)
+            turn_count = store.get_turn_count(session_id)
+
+            # Store new goal with metadata
+            store.append_goal(session_id, body.content)
+            store.set_current_goal(session_id, body.content)
+
+            # Reset taint - fresh task, fresh context
+            store.set_taint(session_id, {
+                "active": False,
+                "source_tool": None,
+                "source_turn": None,
+                "consecutive_aligned": 0,
+            })
+
+            checkpointed = True
+            print(f"[Aegis] Goal checkpoint at turn {turn_count}: {body.content[:60]}...")
+        elif not current_goal:
+            # First goal after session creation
+            store.set_current_goal(session_id, body.content)
+            store.append_goal(session_id, body.content)
+
+    # Increment turn counter
+    store.increment_turn_count(session_id)
+
+    reason = _block_reason(body.content, clf["label"], classifier_score) if blocked else None
+    gate_detail = f"label={clf['label']} · score={classifier_score:.3f}" + (f" · {reason}" if reason else "")
+
+    spans = [
+        _span("Input received", "pass", 0, f"{len(body.content)} chars"),
+        _span("Sentinel classification", "block" if blocked else "pass", duration_ms, gate_detail),
+    ]
+
+    if checkpointed:
+        spans.append(_span("Goal checkpoint", "pass", 0, "Task boundary detected, goal updated, taint reset"))
 
     trace_id = uuid.uuid4().hex
     trace = {
@@ -338,13 +556,10 @@ async def guard_input(session_id: str, body: GuardInputBody):
         "ts_readable": datetime.now().strftime("%H:%M:%S"),
         "prompt": body.content[:500],
         "verdict": verdict,
-        "severity": _severity(final_score),
-        "risk_score": round(final_score, 4),
+        "severity": _severity(classifier_score),
+        "risk_score": round(classifier_score, 4),
         "duration_ms": duration_ms,
-        "spans": [
-            _span("Input received", "pass", 0, f"{len(body.content)} chars"),
-            _span("Input gate", "block" if blocked else "pass", duration_ms, gate_detail),
-        ],
+        "spans": spans,
         "llm_tokens": None,
         "llm_model": None,
         "llm_output": f"This request was blocked by Aegis. Reason: {reason}" if blocked else None,
@@ -355,17 +570,58 @@ async def guard_input(session_id: str, body: GuardInputBody):
         store.set_active_trace(session_id, trace_id)
     await publish(session_id, trace)
 
+    # ── Job B Judge (periodic audit every N turns) ─────────────────────────────
+    turn_count = store.get_turn_count(session_id)
+    if not blocked and settings.judge_enabled and turn_count % settings.judge_audit_interval == 0:
+        goal = store.get_current_goal(session_id) or store.get_original_goal(session_id)
+        if goal:
+            judge = get_judge(settings.judge_api_key, settings.judge_model, settings.judge_provider)
+            if judge:
+                # Sanitize history
+                traces = store.get_traces(session_id)
+                sanitized = sanitize_history(traces, classifier, session_id, store)
+
+                # Get taint info
+                taint = store.get_taint(session_id)
+
+                # Call judge Job B
+                verdict = judge.job_b_periodic_audit(
+                    goal=goal,
+                    sanitized_history=sanitized,
+                    turn_count=turn_count,
+                    tainted=taint.get("active", False),
+                )
+
+                # Apply verdict to session state
+                _apply_judge_verdict(session_id, verdict)
+
+                # Log judge verdict as separate trace
+                judge_trace = {
+                    "trace_id": uuid.uuid4().hex,
+                    "session_id": session_id,
+                    "ts": time.time(),
+                    "ts_readable": datetime.now().strftime("%H:%M:%S"),
+                    "prompt": f"Judge: Periodic Security Check (Turn {turn_count})",
+                    "verdict": verdict["verdict"].lower(),
+                    "severity": "High" if verdict["verdict"] == "HIJACKED" else "Medium" if verdict["verdict"] in ["UNCERTAIN", "DRIFTED"] else "Low",
+                    "risk_score": 0.0,
+                    "duration_ms": 0,
+                    "spans": [_span("Judge: Session Audit", verdict["verdict"].lower(), 0, verdict["reason"])],
+                    "llm_tokens": None,
+                    "llm_model": settings.judge_model,
+                    "finalized": True,
+                }
+                store.log_trace(judge_trace)
+                await publish(session_id, judge_trace)
+                print(f"[Aegis] Job B audit at turn {turn_count}: {verdict['verdict']}")
+
     return {
         "trace_id": trace_id,
         "allowed": not blocked,
         "blocked": blocked,
         "block_reason": reason,
-        "risk_score": round(final_score, 4),
-        "scores": {
-            "classifier": round(classifier_score, 4),
-            "trajectory": round(trajectory_score, 4),
-            "final": round(final_score, 4),
-        },
+        "risk_score": round(classifier_score, 4),
+        "score": round(classifier_score, 4),
     }
 
 
@@ -392,6 +648,21 @@ async def guard_tool(session_id: str, body: GuardToolBody):
         block_reason = f"Tool '{body.tool_name}' is on the denylist"
         spans.append(_tool_span("Tool denylist", "block", 0, body.tool_name, block_reason))
 
+    # ── Phase 0: PoLP Capability Profile ────────────────────────────────────
+    if not blocked:
+        t0 = time.perf_counter()
+        polp_blocked, polp_reason = check_polp(body.tool_name, body.tool_args)
+        ms0 = int((time.perf_counter() - t0) * 1000)
+        total_ms += ms0
+
+        if polp_blocked:
+            blocked = True
+            final_risk = 0.95
+            block_reason = polp_reason
+            spans.append(_tool_span("PoLP profile", "block", ms0, body.tool_name, polp_reason))
+        else:
+            spans.append(_tool_span("PoLP profile", "pass", ms0, body.tool_name, "Capability check passed"))
+
     if not blocked:
         # ── Phase 1: Deterministic Sandbox ─────────────────────────────────
         t1 = time.perf_counter()
@@ -408,10 +679,21 @@ async def guard_tool(session_id: str, body: GuardToolBody):
             spans.append(_tool_span("Sandbox", "pass", ms1, body.tool_name, "Filesystem and network checks passed"))
 
             # ── Phase 2: Contextual Intent Verifier ────────────────────────
-            goal = store.get_original_goal(session_id)
-            if goal:
+            goal = store.get_current_goal(session_id) or store.get_original_goal(session_id)
+            taint = store.get_taint(session_id)
+
+            # Skip verifier if tainted (LLM reasoning untrusted)
+            if taint.get("active"):
+                spans.append(_tool_span(
+                    "Intent verification", "skip", 0, body.tool_name,
+                    "Skipped - session tainted, judge will handle"
+                ))
+            elif goal:
                 t2 = time.perf_counter()
-                ph2_flagged, flagged_tokens = _phase2_intent(goal, body.tool_name, body.tool_args)
+                tool_history = store.get_tool_history(session_id)
+                ph2_flagged, flagged_tokens = _phase2_intent(
+                    goal, body.tool_name, body.tool_args, tool_history
+                )
                 ms2 = int((time.perf_counter() - t2) * 1000)
                 total_ms += ms2
 
@@ -430,7 +712,7 @@ async def guard_tool(session_id: str, body: GuardToolBody):
             else:
                 final_risk = 0.0
 
-    # ---- Fold into active trace ------------------------------------------------
+    # ---- Fold into active trace (or create if missing) ------------------------
     active = store.get_active_trace(session_id)
     if active:
         active["spans"].extend(spans)
@@ -438,15 +720,24 @@ async def guard_tool(session_id: str, body: GuardToolBody):
             active["verdict"] = "blocked"
             active["risk_score"] = round(max(active.get("risk_score", 0.0), final_risk), 4)
             active["severity"] = _severity(active["risk_score"])
-        elif final_risk > 0:
-            active["risk_score"] = round(max(active.get("risk_score", 0.0), final_risk), 4)
-            active["severity"] = _severity(active["risk_score"])
-        active["duration_ms"] = active.get("duration_ms", 0) + total_ms
-        store.update_trace(active)
-        await publish(session_id, active)
-        trace_id = active["trace_id"]
+            # Finalize immediately when blocked - trace ends here
+            active["finalized"] = True
+            store.update_trace(active)
+            store.clear_active_trace(session_id)
+            await publish(session_id, active)
+            trace_id = active["trace_id"]
+        else:
+            if final_risk > 0:
+                active["risk_score"] = round(max(active.get("risk_score", 0.0), final_risk), 4)
+                active["severity"] = _severity(active["risk_score"])
+            active["duration_ms"] = active.get("duration_ms", 0) + total_ms
+            store.update_trace(active)
+            await publish(session_id, active)
+            trace_id = active["trace_id"]
     else:
+        # No active trace - create one (for standalone tool calls during testing)
         trace_id = uuid.uuid4().hex
+        finalized = blocked  # Finalize immediately if blocked
         trace = {
             "trace_id": trace_id,
             "session_id": session_id,
@@ -460,10 +751,68 @@ async def guard_tool(session_id: str, body: GuardToolBody):
             "spans": spans,
             "llm_tokens": None,
             "llm_model": None,
-            "finalized": True,
+            "finalized": finalized,
         }
         store.log_trace(trace)
+        if not finalized:
+            store.set_active_trace(session_id, trace_id)  # Only set as active if not finalized
         await publish(session_id, trace)
+
+    # ── Job A Judge (if tainted or verifier UNCERTAIN) ────────────────────────
+    if not blocked and settings.judge_enabled:
+        taint = store.get_taint(session_id)
+        goal = store.get_current_goal(session_id) or store.get_original_goal(session_id)
+
+        # Trigger Job A if: tainted context OR verifier flagged (UNCERTAIN)
+        should_judge = taint.get("active") or (final_risk > 0 and final_risk < 0.95)
+
+        if should_judge and goal:
+            judge = get_judge(settings.judge_api_key, settings.judge_model, settings.judge_provider)
+            if judge:
+                # Sanitize history
+                traces = store.get_traces(session_id)
+                sanitized = sanitize_history(traces, classifier, session_id, store)
+
+                # Get tool history
+                tool_history = store.get_tool_history(session_id)
+
+                # Call judge
+                taint_source = None
+                if taint.get("active"):
+                    taint_source = {
+                        "source_tool": taint.get("source_tool"),
+                        "source_turn": taint.get("source_turn"),
+                    }
+
+                verdict = judge.job_a_tool_gate(
+                    goal=goal,
+                    sanitized_history=sanitized,
+                    tool_history=tool_history,
+                    tool_name=body.tool_name,
+                    tool_args=body.tool_args,
+                    tainted=taint.get("active", False),
+                    taint_source=taint_source,
+                )
+
+                # Apply verdict to session state
+                _apply_judge_verdict(session_id, verdict)
+
+                # Log judge verdict to trace
+                active = store.get_active_trace(session_id)
+                if active:
+                    judge_detail = f"{verdict['verdict']}: {verdict['reason']}"
+                    active["spans"].append(_span("Judge: Tool Coherence Check", verdict['verdict'].lower(), 0, judge_detail))
+                    active["llm_model"] = settings.judge_model
+                    store.update_trace(active)
+                    await publish(session_id, active)
+
+    # Append successful tool calls to history (last 5, for stateful verifier)
+    if not blocked:
+        store.append_tool_call(session_id, {
+            "tool_name": body.tool_name,
+            "tool_args": body.tool_args,
+            "ts": time.time(),
+        })
 
     return {
         "trace_id": trace_id,
@@ -475,6 +824,123 @@ async def guard_tool(session_id: str, body: GuardToolBody):
 
 
 # ---------------------------------------------------------------------------
+# Guard — tool output
+# ---------------------------------------------------------------------------
+
+@router.post("/sessions/{session_id}/guard/tool_output")
+async def guard_tool_output(session_id: str, body: GuardToolOutputBody):
+    """
+    Tool output gate - fires after tool executes, before output reaches LLM.
+
+    Phase 1: Taint classification
+    Phase 2: PII scan
+    Phase 3: Taint metadata propagation
+    """
+    _require_session(session_id)
+    t_start = time.perf_counter()
+
+    blocked = False
+    verdict = "allowed"
+    reason = None
+    redacted_output = body.tool_output
+    spans = []
+
+    # Phase 1: Taint classification
+    t1 = time.perf_counter()
+    tainted_tools = ["read_file", "http_request", "bash", "curl", "wget",
+                     "fetch", "download", "shell_exec", "run_command"]
+    is_tainted = body.tool_name.lower() in tainted_tools
+
+    if is_tainted:
+        taint = store.get_taint(session_id)
+        if not taint.get("active"):
+            # First taint in session
+            turn_count = store.get_turn_count(session_id)
+            taint = {
+                "active": True,
+                "source_tool": body.tool_name,
+                "source_turn": turn_count,
+                "consecutive_aligned": 0,
+            }
+            store.set_taint(session_id, taint)
+
+    ms1 = int((time.perf_counter() - t1) * 1000)
+    taint_status = "tainted" if is_tainted else "clean"
+    spans.append(_span("Taint classification", taint_status, ms1,
+                       f"Tool: {body.tool_name} → {taint_status}"))
+
+    # Phase 2: PII scan - redact all PII, never block
+    t2 = time.perf_counter()
+    pii_result = pii_detector.scan(body.tool_output)
+    ms2 = int((time.perf_counter() - t2) * 1000)
+
+    if pii_result["entities"]:
+        # Redact all PII (critical and soft)
+        redacted_output = pii_result["redacted_text"]
+        entity_types = list(set(e["type"] for e in pii_result["entities"]))
+        spans.append(_span("PII scan", "redact", ms2,
+                          f"Redacted: {', '.join(entity_types)}"))
+    else:
+        spans.append(_span("PII scan", "pass", ms2, "No PII detected"))
+
+    duration_ms = int((time.perf_counter() - t_start) * 1000)
+
+    # Add to active trace (or create if missing)
+    active = store.get_active_trace(session_id)
+    if active:
+        active["spans"].extend(spans)
+        if blocked:
+            active["verdict"] = "blocked"
+            active["risk_score"] = 0.9
+            active["severity"] = "High"
+        active["duration_ms"] = active.get("duration_ms", 0) + duration_ms
+        store.update_trace(active)
+        await publish(session_id, active)
+        trace_id = active["trace_id"]
+    else:
+        # No active trace - create one
+        trace_id = uuid.uuid4().hex
+        trace = {
+            "trace_id": trace_id,
+            "session_id": session_id,
+            "ts": time.time(),
+            "ts_readable": datetime.now().strftime("%H:%M:%S"),
+            "prompt": f"[tool_output:{body.tool_name}]",
+            "verdict": verdict,
+            "severity": "High" if blocked else "Low",
+            "risk_score": 0.9 if blocked else 0.0,
+            "duration_ms": duration_ms,
+            "spans": spans,
+            "llm_tokens": None,
+            "llm_model": None,
+            "finalized": False,  # Keep active
+        }
+        store.log_trace(trace)
+        store.set_active_trace(session_id, trace_id)
+        await publish(session_id, trace)
+
+    # Phase 3: Taint metadata propagation
+    response = {
+        "trace_id": trace_id,
+        "allowed": not blocked,
+        "blocked": blocked,
+        "block_reason": reason,
+        "output": redacted_output,
+    }
+
+    # Attach taint metadata if tool was tainted
+    if is_tainted:
+        taint = store.get_taint(session_id)
+        response["taint_metadata"] = {
+            "tainted": True,
+            "source_tool": taint.get("source_tool"),
+            "source_turn": taint.get("source_turn"),
+        }
+
+    return response
+
+
+# ---------------------------------------------------------------------------
 # Guard — output
 # ---------------------------------------------------------------------------
 
@@ -483,40 +949,10 @@ async def guard_output(session_id: str, body: GuardOutputBody):
     _require_session(session_id)
     t_start = time.perf_counter()
 
-    if body.trust:
-        # Trusted output — LLM is responding to a blocked input (natural refusal).
-        # Skip classification to avoid false positives on refusal language.
-        output_score = 0.0
-        blocked = False
-        verdict = "allowed"
-        reason = None
-        output_detail = "Trusted · LLM refusal response (input was blocked)"
-        duration_ms = 0
-    else:
-        # Phase 1: regex check for indirect prompt injection patterns in the output.
-        # These are reliable signals regardless of ML score.
-        indirect_match = _INDIRECT_INJECTION_PATTERNS.search(body.content)
-        if indirect_match:
-            output_score = 1.0
-            blocked = True
-            reason = f"Indirect prompt injection pattern: '{indirect_match.group(0)[:60]}'"
-            output_detail = f"label=injection · score=1.000 · {reason}"
-            duration_ms = int((time.perf_counter() - t_start) * 1000)
-        else:
-            # Phase 2: ML classifier at a high threshold — only catch near-certain cases.
-            # The input jailbreak classifier has a high false-positive rate on normal
-            # LLM responses; requiring 0.97+ avoids flagging benign clarification text.
-            clf = classifier.classify(body.content)
-            output_score = clf["score"]
-            duration_ms = int((time.perf_counter() - t_start) * 1000)
-            blocked = output_score > OUTPUT_ML_THRESHOLD
-            reason = _block_reason(body.content, clf["label"], output_score) if blocked else None
-            output_detail = (
-                f"label={clf['label']} · score={output_score:.3f} · {reason}"
-                if blocked else
-                f"label={clf['label']} · score={output_score:.3f} · Clean"
-            )
-        verdict = "blocked" if blocked else "allowed"
+    blocked = False
+    verdict = "allowed"
+    reason = None
+    output_score = 0.0
 
     # Append to open trace if available
     active = store.get_active_trace(session_id)
@@ -524,18 +960,21 @@ async def guard_output(session_id: str, body: GuardOutputBody):
         traces = store.get_traces(session_id)
         active = next((t for t in traces if t["trace_id"] == body.trace_id), None)
 
-    # Phase 3: PII detection — runs even when output is clean (to redact without blocking)
+    # PII detection — runs on all outputs unless trusted
     pii_result = {"should_block": False, "block_reason": None, "redacted_text": body.content, "entities": []}
     redacted_content = None
-    if not body.trust and not blocked:
+    duration_ms = 0
+
+    if not body.trust:
         t_pii = time.perf_counter()
         pii_result = pii_detector.scan(body.content)
         pii_ms = int((time.perf_counter() - t_pii) * 1000)
-        duration_ms += pii_ms
+        duration_ms = pii_ms
         if pii_result["should_block"]:
             blocked = True
             reason = pii_result["block_reason"]
             verdict = "blocked"
+            output_score = 0.9
             pii_detail = f"BLOCK · {reason}"
         elif pii_result["entities"]:
             pii_detail = f"Redacted {len(pii_result['entities'])} PII entities"
@@ -548,11 +987,51 @@ async def guard_output(session_id: str, body: GuardOutputBody):
 
     final_content = body.content[:4000]
 
+    # ── Job A Judge (fires on every response) - run BEFORE finalizing ────────
+    judge_verdict_span = None
+    if not blocked and settings.judge_enabled:
+        goal = store.get_current_goal(session_id) or store.get_original_goal(session_id)
+        if goal:
+            judge = get_judge(settings.judge_api_key, settings.judge_model, settings.judge_provider)
+            if judge:
+                # Sanitize history
+                traces = store.get_traces(session_id)
+                sanitized = sanitize_history(traces, classifier, session_id, store)
+
+                # Get taint info
+                taint = store.get_taint(session_id)
+                taint_source = None
+                if taint.get("active"):
+                    taint_source = {
+                        "source_tool": taint.get("source_tool"),
+                        "source_turn": taint.get("source_turn"),
+                    }
+
+                # Call judge
+                judge_verdict = judge.job_a_output_gate(
+                    goal=goal,
+                    sanitized_history=sanitized,
+                    output=body.content,
+                    tainted=taint.get("active", False),
+                    taint_source=taint_source,
+                )
+
+                # Apply verdict to session state
+                _apply_judge_verdict(session_id, judge_verdict)
+
+                # Create span for judge verdict
+                judge_verdict_span = _span(
+                    "Judge: Output Coherence Check",
+                    judge_verdict["verdict"].lower(),
+                    0,
+                    f"{judge_verdict['verdict'].upper()}: {judge_verdict['reason']}"
+                )
+
+    # Add all spans including judge to trace, then finalize
     if active:
-        active["spans"].append(
-            _span("Output gate", "block" if blocked else "pass", duration_ms, output_detail)
-        )
         active["spans"].extend(spans_pii)
+        if judge_verdict_span:
+            active["spans"].append(judge_verdict_span)
         active["verdict"] = verdict
         active["severity"] = _severity(max(active.get("risk_score", 0.0), output_score))
         active["risk_score"] = round(max(active.get("risk_score", 0.0), output_score), 4)
@@ -564,6 +1043,10 @@ async def guard_output(session_id: str, body: GuardOutputBody):
         await publish(session_id, active)
         trace_id = active["trace_id"]
     else:
+        all_spans = spans_pii.copy()
+        if judge_verdict_span:
+            all_spans.append(judge_verdict_span)
+
         trace_id = body.trace_id or uuid.uuid4().hex
         trace = {
             "trace_id": trace_id,
@@ -575,11 +1058,7 @@ async def guard_output(session_id: str, body: GuardOutputBody):
             "severity": _severity(output_score),
             "risk_score": round(output_score, 4),
             "duration_ms": duration_ms,
-            "spans": [
-                _span("Output gate", "block" if blocked else "pass", duration_ms,
-                      f"score={output_score:.3f}" if blocked else "Clean"),
-                *spans_pii,
-            ],
+            "spans": all_spans,
             "llm_tokens": None,
             "llm_model": None,
             "llm_output": final_content,
@@ -593,7 +1072,6 @@ async def guard_output(session_id: str, body: GuardOutputBody):
         "allowed": not blocked,
         "blocked": blocked,
         "block_reason": reason,
-        "output_score": round(output_score, 4),
         "redacted_content": redacted_content,
     }
 
@@ -604,66 +1082,21 @@ async def guard_output(session_id: str, body: GuardOutputBody):
 
 @router.post("/sessions/{session_id}/guard/media")
 async def guard_media(session_id: str, body: GuardMediaBody):
+    """Media gate temporarily disabled to reduce memory usage during development."""
     _require_session(session_id)
-    t_start = time.perf_counter()
 
-    try:
-        image_data = base64.b64decode(body.image_b64)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid base64 image data")
-
-    spans = []
-    blocked = False
-    block_reason = None
-
-    # Phase 1: NSFW classification
-    t1 = time.perf_counter()
-    nsfw_result = nsfw_detector.is_nsfw(image_data)
-    ms1 = int((time.perf_counter() - t1) * 1000)
-    if nsfw_result["nsfw"]:
-        blocked = True
-        block_reason = f"NSFW content detected (score={nsfw_result['score']:.2f})"
-        spans.append(_span("NSFW check", "block", ms1, block_reason))
-    else:
-        spans.append(_span("NSFW check", "pass", ms1, f"score={nsfw_result['score']:.3f}"))
-
-    # Phase 2: OCR + injection check
-    if not blocked:
-        t2 = time.perf_counter()
-        ocr_text = nsfw_detector.extract_text(image_data)
-        ms2 = int((time.perf_counter() - t2) * 1000)
-        if ocr_text.strip():
-            indirect_match = _INDIRECT_INJECTION_PATTERNS.search(ocr_text)
-            if indirect_match:
-                blocked = True
-                block_reason = f"Prompt injection in image text: '{indirect_match.group(0)[:60]}'"
-                spans.append(_span("OCR injection check", "block", ms2, block_reason))
-            else:
-                clf = classifier.classify(ocr_text)
-                if clf["score"] > THRESHOLD:
-                    blocked = True
-                    block_reason = f"Suspicious text in image (score={clf['score']:.3f})"
-                    spans.append(_span("OCR injection check", "block", ms2, block_reason))
-                else:
-                    spans.append(_span("OCR injection check", "pass", ms2, f"score={clf['score']:.3f}"))
-        else:
-            spans.append(_span("OCR injection check", "pass", 0, "No text detected"))
-
-    duration_ms = int((time.perf_counter() - t_start) * 1000)
-    verdict = "blocked" if blocked else "allowed"
-    risk = 0.95 if blocked else 0.0
-
+    trace_id = uuid.uuid4().hex
     trace = {
-        "trace_id": uuid.uuid4().hex,
+        "trace_id": trace_id,
         "session_id": session_id,
         "ts": time.time(),
         "ts_readable": datetime.now().strftime("%H:%M:%S"),
         "prompt": "[media:image]",
-        "verdict": verdict,
-        "severity": _severity(risk),
-        "risk_score": round(risk, 4),
-        "duration_ms": duration_ms,
-        "spans": spans,
+        "verdict": "allowed",
+        "severity": "Low",
+        "risk_score": 0.0,
+        "duration_ms": 0,
+        "spans": [_span("Media gate", "pass", 0, "Temporarily disabled")],
         "llm_tokens": None,
         "llm_model": None,
         "finalized": True,
@@ -672,10 +1105,10 @@ async def guard_media(session_id: str, body: GuardMediaBody):
     await publish(session_id, trace)
 
     return {
-        "trace_id": trace["trace_id"],
-        "allowed": not blocked,
-        "blocked": blocked,
-        "block_reason": block_reason,
+        "trace_id": trace_id,
+        "allowed": True,
+        "blocked": False,
+        "block_reason": None,
     }
 
 
@@ -707,6 +1140,17 @@ def get_session(session_id: str):
     if sess is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return sess
+
+
+@router.patch("/sessions/{session_id}/state")
+def set_session_state(session_id: str, state: str):
+    """Temporary test endpoint for setting session state"""
+    if not store.exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    if state not in ["ACTIVE", "FLAGGED", "COMPROMISED"]:
+        raise HTTPException(status_code=400, detail="Invalid state")
+    store.set_state(session_id, state)
+    return {"session_id": session_id, "state": state}
 
 
 # ---------------------------------------------------------------------------
@@ -826,4 +1270,90 @@ def remove_tool_denylist(tool_name: str):
     net = _load_net()
     net["tool_denylist"] = [t for t in net.get("tool_denylist", []) if t.lower() != tool_name.lower()]
     _save_net(net)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# PoLP Profile Management
+# ---------------------------------------------------------------------------
+
+def _load_polp() -> Dict[str, Any]:
+    """Load PoLP profile from YAML file."""
+    if _polp_path.exists():
+        try:
+            return yaml.safe_load(_polp_path.read_text()) or {}
+        except Exception as e:
+            print(f"[Aegis] Error loading PoLP profile: {e}")
+    return {}
+
+
+def _save_polp(profile: Dict[str, Any]) -> None:
+    """Save PoLP profile to YAML file and reload global."""
+    global _POLP_PROFILE
+    _polp_path.write_text(yaml.dump(profile, default_flow_style=False, sort_keys=False))
+    _POLP_PROFILE = profile
+    print(f"[Aegis] Saved PoLP profile with {len(profile)} tool rules")
+
+
+class PolpRuleBody(BaseModel):
+    blocked: Optional[bool] = None
+    allowed_paths: Optional[List[str]] = None
+    allowed_domains: Optional[List[str]] = None
+    blocked_domains: Optional[List[str]] = None
+    allowed_recipient_domains: Optional[List[str]] = None
+
+
+@router.get("/polp/profile")
+def get_polp_profile():
+    """Get complete PoLP profile."""
+    return _load_polp()
+
+
+@router.post("/polp/profile")
+def update_polp_profile(profile: Dict[str, Any]):
+    """Replace entire PoLP profile."""
+    _save_polp(profile)
+    return {"ok": True}
+
+
+@router.get("/polp/tool/{tool_name}")
+def get_polp_tool_rule(tool_name: str):
+    """Get PoLP rule for a specific tool."""
+    profile = _load_polp()
+    rule = profile.get(tool_name)
+    if rule is None:
+        raise HTTPException(404, f"No PoLP rule for {tool_name}")
+    return rule
+
+
+@router.post("/polp/tool/{tool_name}")
+def update_polp_tool_rule(tool_name: str, body: PolpRuleBody):
+    """Add or update PoLP rule for a specific tool."""
+    profile = _load_polp()
+
+    # Build rule from non-None fields
+    rule = {}
+    if body.blocked is not None:
+        rule["blocked"] = body.blocked
+    if body.allowed_paths is not None:
+        rule["allowed_paths"] = body.allowed_paths
+    if body.allowed_domains is not None:
+        rule["allowed_domains"] = body.allowed_domains
+    if body.blocked_domains is not None:
+        rule["blocked_domains"] = body.blocked_domains
+    if body.allowed_recipient_domains is not None:
+        rule["allowed_recipient_domains"] = body.allowed_recipient_domains
+
+    profile[tool_name] = rule
+    _save_polp(profile)
+    return {"ok": True}
+
+
+@router.delete("/polp/tool/{tool_name}")
+def delete_polp_tool_rule(tool_name: str):
+    """Remove PoLP rule for a specific tool."""
+    profile = _load_polp()
+    if tool_name in profile:
+        del profile[tool_name]
+        _save_polp(profile)
     return {"ok": True}

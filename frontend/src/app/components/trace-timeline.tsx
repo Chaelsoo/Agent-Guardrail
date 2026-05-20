@@ -2,7 +2,7 @@ import { Trace } from '../types';
 import { StatusBadge } from './status-badge';
 import {
   ArrowRight, Clock,
-  Inbox, Shield, Send, RefreshCw, Box, ScanLine, Wrench,
+  Inbox, Shield, Send, RefreshCw, Box, ScanLine, Wrench, Brain,
   type LucideIcon,
 } from 'lucide-react';
 import { format } from 'date-fns';
@@ -13,6 +13,7 @@ interface TraceTimelineProps {
 
 function spanIcon(name: string, isTool: boolean): LucideIcon {
   const base = name.replace(/:.*$/, '').trim().toLowerCase();
+  if (base.includes('judge') || base.includes('llm')) return Brain;
   if (isTool) {
     if (base === 'sandbox')        return Box;
     if (base.includes('intent'))   return ScanLine;
@@ -27,8 +28,11 @@ function spanIcon(name: string, isTool: boolean): LucideIcon {
 
 function iconColor(status: string, isTool: boolean): string {
   if (status === 'blocked')  return '#ef4444';
+  if (status === 'hijacked') return '#ef4444';
   if (status === 'redacted') return '#f59e0b';
+  if (status === 'uncertain') return '#f59e0b';
   if (status === 'flagged')  return '#eab308';
+  if (status === 'aligned')  return '#10b981';
   return isTool ? '#6366f1' : '#10b981';
 }
 
@@ -47,8 +51,11 @@ function formatSpanName(name: string): string {
 
 function stateLabel(status: string): string {
   if (status === 'blocked')  return 'blocked';
+  if (status === 'hijacked') return 'HIJACKED';
   if (status === 'redacted') return 'redacted';
+  if (status === 'uncertain') return 'UNCERTAIN';
   if (status === 'flagged')  return 'flagged';
+  if (status === 'aligned')  return 'ALIGNED';
   return 'pass';
 }
 

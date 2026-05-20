@@ -1,0 +1,17 @@
+read_file:
+  blocked: false
+  allowed_paths:
+  - /home/user/workspace/
+  - /tmp/
+http_request:
+  blocked: false
+  allowed_domains:
+  - api.company.com
+  - github.com
+  blocked_domains:
+  - pastebin.com
+  - ngrok.io
+send_email:
+  blocked: false
+  allowed_recipient_domains:
+  - company.com

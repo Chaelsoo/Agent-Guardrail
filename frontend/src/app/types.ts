@@ -1,6 +1,20 @@
 export type SeverityLevel = 'critical' | 'high' | 'medium' | 'low' | 'info';
-export type TraceStatus = 'allowed' | 'blocked' | 'redacted' | 'flagged';
+export type TraceStatus = 'allowed' | 'blocked' | 'redacted' | 'flagged' | 'aligned' | 'uncertain' | 'hijacked';
 export type AgentType = 'customer-support' | 'data-analysis' | 'code-generation' | 'research';
+export type SessionState = 'ACTIVE' | 'FLAGGED' | 'COMPROMISED';
+
+export interface TaintInfo {
+  active: boolean;
+  source_tool?: string;
+  source_turn?: number;
+  consecutive_aligned: number;
+}
+
+export interface Goal {
+  goal: string;
+  start_turn: number;
+  end_turn?: number;
+}
 
 export interface Session {
   id: string;
@@ -10,6 +24,11 @@ export interface Session {
   startTime: Date;
   lastActivity: Date;
   traceCount: number;
+  state?: SessionState;
+  current_goal?: string;
+  taint?: TaintInfo;
+  goals?: Goal[];
+  turn_count?: number;
 }
 
 export interface PipelineStep {
