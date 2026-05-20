@@ -98,7 +98,9 @@ export function SessionsPage() {
       try {
         const res = await fetch(`${BASE}/sessions`);
         const data: any[] = await res.json();
-        const mapped = data.map(mapSession);
+        // Filter out ended sessions
+        const active = data.filter(s => !s.ended);
+        const mapped = active.map(mapSession);
         setSessions(mapped);
         // Auto-select first session if none selected
         setSelectedSessionId(prev => prev ?? (mapped[0]?.id || null));

@@ -99,6 +99,7 @@ class InMemoryStore:
             "taint": {"active": False, "consecutive_aligned": 0},
             "tool_history": [],
             "turn_count": 0,
+            "ended": False,
         }
 
     def exists(self, session_id: str) -> bool:
@@ -192,6 +193,10 @@ class InMemoryStore:
         if session_id in self._sessions:
             self._sessions[session_id]["state"] = state
 
+    def set_ended(self, session_id: str, ended: bool) -> None:
+        if session_id in self._sessions:
+            self._sessions[session_id]["ended"] = ended
+
     def get_current_goal(self, session_id: str) -> Optional[str]:
         return self._sessions.get(session_id, {}).get("current_goal")
 
@@ -256,7 +261,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     state        TEXT DEFAULT 'ACTIVE',
     current_goal TEXT,
     taint        TEXT DEFAULT '{"active": false, "consecutive_aligned": 0}',
-    turn_count   INTEGER DEFAULT 0
+    turn_count   INTEGER DEFAULT 0,
+    ended        INTEGER DEFAULT 0
 );
 """
 
@@ -328,8 +334,8 @@ class SQLiteStore:
                 """
                 INSERT OR IGNORE INTO sessions
                     (session_id, created_at, agent_type, environment, session_config,
-                     cumulative_risk, trace_count, severity, state, current_goal, taint, turn_count)
-                VALUES (?, ?, ?, ?, ?, 0, 0, 'Low', 'ACTIVE', NULL, ?, 0)
+                     cumulative_risk, trace_count, severity, state, current_goal, taint, turn_count, ended)
+                VALUES (?, ?, ?, ?, ?, 0, 0, 'Low', 'ACTIVE', NULL, ?, 0, 0)
                 """,
                 (
                     session_id,
@@ -460,13 +466,14 @@ class SQLiteStore:
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT session_id, created_at, agent_type, environment, "
-                "cumulative_risk, trace_count, severity, state, current_goal, taint, turn_count "
+                "cumulative_risk, trace_count, severity, state, current_goal, taint, turn_count, ended "
                 "FROM sessions ORDER BY created_at DESC"
             ).fetchall()
         result = []
         for r in rows:
             sess = dict(r)
             sess["taint"] = json.loads(sess.get("taint") or '{"active": false, "consecutive_aligned": 0}')
+            sess["ended"] = bool(sess.get("ended", 0))
             result.append(sess)
         return result
 
@@ -474,7 +481,7 @@ class SQLiteStore:
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT session_id, created_at, agent_type, environment, "
-                "cumulative_risk, trace_count, severity, state, current_goal, taint, turn_count "
+                "cumulative_risk, trace_count, severity, state, current_goal, taint, turn_count, ended "
                 "FROM sessions WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
@@ -482,6 +489,7 @@ class SQLiteStore:
             return None
         sess = dict(row)
         sess["taint"] = json.loads(sess.get("taint") or '{"active": false, "consecutive_aligned": 0}')
+        sess["ended"] = bool(sess.get("ended", 0))
         sess["traces"] = self.get_traces(session_id)
         return sess
 
@@ -554,6 +562,13 @@ class SQLiteStore:
             conn.execute(
                 "UPDATE sessions SET state = ? WHERE session_id = ?",
                 (state, session_id),
+            )
+
+    def set_ended(self, session_id: str, ended: bool) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE sessions SET ended = ? WHERE session_id = ?",
+                (1 if ended else 0, session_id),
             )
 
     def get_current_goal(self, session_id: str) -> Optional[str]:

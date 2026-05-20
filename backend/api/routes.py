@@ -90,6 +90,7 @@ class GuardOutputBody(BaseModel):
     content: str
     trace_id: Optional[str] = None
     trust: bool = False  # skip classification — used when LLM responds to a blocked input
+    is_refusal: bool = False  # indicates this is a forced refusal after blocked input
 
 
 class GuardToolBody(BaseModel):
@@ -950,8 +951,8 @@ async def guard_output(session_id: str, body: GuardOutputBody):
     t_start = time.perf_counter()
 
     blocked = False
-    verdict = "allowed"
-    reason = None
+    verdict = "refusal" if body.is_refusal else "allowed"
+    reason = "Input blocked - forced refusal" if body.is_refusal else None
     output_score = 0.0
 
     # Append to open trace if available
@@ -983,7 +984,11 @@ async def guard_output(session_id: str, body: GuardOutputBody):
             pii_detail = "No PII detected"
         spans_pii = [_span("PII scan", "block" if pii_result["should_block"] else "pass", pii_ms, pii_detail)]
     else:
-        spans_pii = []
+        # Trusted output - add appropriate span
+        if body.is_refusal:
+            spans_pii = [_span("Forced refusal", "pass", 0, "Input was blocked - delivering refusal message")]
+        else:
+            spans_pii = [_span("Trusted output", "pass", 0, "Security checks skipped (trusted content)")]
 
     final_content = body.content[:4000]
 
@@ -1151,6 +1156,15 @@ def set_session_state(session_id: str, state: str):
         raise HTTPException(status_code=400, detail="Invalid state")
     store.set_state(session_id, state)
     return {"session_id": session_id, "state": state}
+
+
+@router.post("/sessions/{session_id}/end")
+def end_session(session_id: str):
+    """Mark a session as ended/completed"""
+    if not store.exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    store.set_ended(session_id, True)
+    return {"session_id": session_id, "ended": True}
 
 
 # ---------------------------------------------------------------------------
